@@ -1,26 +1,18 @@
 """
-realtime.py — Realtime Face Anti-Spoofing với webcam
-
-Cải tiến so với version cũ:
-    - Fix bug label mapping (false=0=spoof, true=1=live)
-    - Thêm confidence threshold (chỉ hiện kết quả khi model đủ tự tin)
-    - Thêm margin khi crop face (giống lúc preprocess)
-    - Hiển thị confidence % trên màn hình
-    - Smooth kết quả qua nhiều frame (tránh nhấp nháy)
-    - Dùng PyTorch trực tiếp thay vì ONNX (dùng luôn model đã train)
-
-Cài đặt:
+Face Anti-Spoofing Realtime Demo
+Requirements:
     pip install opencv-python torch torchvision ultralytics
 
-Chạy:
+Usage:
     python realtime.py
-    Nhấn Q để thoát
+    Press Q to quit
 """
 
 import cv2
+import time
 import torch
 import numpy as np
-from collections import deque
+from collections import deque, Counter
 from torchvision import transforms
 from ultralytics import YOLO
 
@@ -33,21 +25,25 @@ from models.mobilenetv3 import build_model
 # CONFIG
 # ============================================================
 
-# Đường dẫn model — dùng fine-tunbád model
-#MODEL_PATH = "best_model_base.pth"
 MODEL_PATH = "best_model_mixed.pth"
-# Confidence threshold:
-# Chỉ hiện kết quả khi model tự tin hơn ngưỡng này
-# Nếu confidence thấp hơn → hiện "UNCERTAIN"
-CONFIDENCE_THRESHOLD = 0.55  # 55% là ngưỡng hợp lý để giảm nhấp nháy nhưng vẫn k miss nhiều spoof
+FACE_DET_PATH = r"G:\FPTU CAC KY\FPTU ki 5\DPL302m\ToanBoFinalProject\model.pt"
 
-# Margin khi crop face (giống lúc preprocess)
+# Filter 1: minimum gap between live/spoof probability to avoid uncertain zone
+FAS_DEAD_ZONE = 0.30
+
+# Filter 2: minimum confidence to show a prediction
+CONFIDENCE_THRESHOLD = 0.55
+
+# Margin ratio added around face bounding box (matches preprocessing)
 FACE_MARGIN = 0.2
 
-# Smooth qua N frame gần nhất để tránh nhấp nháy
-SMOOTH_FRAMES = 10
+# Number of recent frames for majority voting smoothing
+SMOOTH_FRAMES = 15
 
-# Kích thước input model
+# Number of consecutive LIVE frames required before confirming LIVE
+LIVE_CONFIRM_FRAMES = 10
+
+# Model input resolution
 INPUT_SIZE = 224
 
 # ============================================================
@@ -55,22 +51,18 @@ INPUT_SIZE = 224
 # ============================================================
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"🖥️  Đang dùng: {DEVICE}")
+print(f"Device: {DEVICE}")
 
 
 def load_antispoof_model(path):
-    """
-    Load FAS model từ checkpoint PyTorch.
-    Dùng trực tiếp thay vì export ONNX.
-    """
+    """Load FAS model from PyTorch checkpoint."""
     model = build_model().to(DEVICE)
     checkpoint = torch.load(path, map_location=DEVICE, weights_only=False)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
-    print(f"✅ Loaded FAS model: {path}")
-    print(f"   Class mapping: {checkpoint.get('class_map', 'N/A')}")
-    # Class mapping: {'false': 0, 'true': 1}
-    # → index 0 = spoof, index 1 = live
+    print(f"Loaded FAS model: {path}")
+    print(f"Class mapping: {checkpoint.get('class_map', 'N/A')}")
+    # Class mapping: {'false': 0, 'true': 1} → index 0 = spoof, index 1 = live
     return model
 
 
@@ -78,7 +70,7 @@ def load_antispoof_model(path):
 # PREPROCESSING
 # ============================================================
 
-# Transform giống val_transform (không augment)
+# Validation transform — no augmentation
 preprocess = transforms.Compose([
     transforms.ToPILImage(),
     transforms.Resize((INPUT_SIZE, INPUT_SIZE)),
@@ -90,52 +82,45 @@ preprocess = transforms.Compose([
 
 def crop_face_with_margin(frame, box, margin=FACE_MARGIN):
     """
-    Crop mặt từ frame với margin.
+    Crop face region from frame with added margin.
 
     Args:
-        frame : ảnh BGR từ webcam
-        box   : [x1, y1, x2, y2] bounding box từ YOLO
-        margin: tỷ lệ margin thêm vào (giống preprocess)
+        frame  : BGR image from webcam
+        box    : [x1, y1, x2, y2] bounding box from YOLO
+        margin : margin ratio to expand bounding box
 
     Returns:
-        face_rgb: numpy array RGB đã crop, hoặc None nếu crop lỗi
+        face_rgb : RGB numpy array of cropped face, or None if invalid
+        crop_box : adjusted bounding box (x1, y1, x2, y2)
     """
     h, w = frame.shape[:2]
     x1, y1, x2, y2 = map(int, box)
 
-    # Tính margin
-    bw = x2 - x1
-    bh = y2 - y1
-    mx = int(bw * margin)
-    my = int(bh * margin)
+    bw, bh = x2 - x1, y2 - y1
+    mx, my = int(bw * margin), int(bh * margin)
 
-    # Mở rộng bbox, clamp trong giới hạn frame
     x1 = max(0, x1 - mx)
     y1 = max(0, y1 - my)
     x2 = min(w, x2 + mx)
     y2 = min(h, y2 + my)
 
     face_bgr = frame[y1:y2, x1:x2]
-
     if face_bgr.size == 0:
         return None, (x1, y1, x2, y2)
 
-    # Convert BGR → RGB cho model
-    face_rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
-    return face_rgb, (x1, y1, x2, y2)
+    return cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB), (x1, y1, x2, y2)
 
 
 def predict(model, face_rgb):
     """
-    Chạy inference trên 1 ảnh mặt.
+    Run inference on a single face crop.
 
     Returns:
-        label     : "LIVE", "SPOOF", hoặc "UNCERTAIN"
-        confidence: float 0.0 - 1.0
-        live_prob : xác suất là live
-        spoof_prob: xác suất là spoof
+        label      : "LIVE", "SPOOF", or "UNCERTAIN"
+        confidence : float between 0.0 and 1.0
+        live_prob  : probability of being a live face
+        spoof_prob : probability of being a spoof
     """
-    # Preprocess
     tensor = preprocess(face_rgb).unsqueeze(0).to(DEVICE)
 
     with torch.no_grad():
@@ -145,132 +130,139 @@ def predict(model, face_rgb):
     spoof_prob = probs[0].item()
     live_prob  = probs[1].item()
 
-    # Dead zone: nếu 2 class quá gần nhau → UNCERTAIN
-    # Tránh nhấp nháy khi model không chắc
-    diff = abs(live_prob - spoof_prob)
-    if diff < 0.3:               # < 30% chênh lệch → không chắc
+    # Filter 1: dead zone — too close to call
+    if abs(live_prob - spoof_prob) < FAS_DEAD_ZONE:
         return "UNCERTAIN", max(live_prob, spoof_prob), live_prob, spoof_prob
 
-    if live_prob > spoof_prob:
-        return "LIVE",  live_prob,  live_prob, spoof_prob
-    else:
-        return "SPOOF", spoof_prob, live_prob, spoof_prob
+    label      = "LIVE" if live_prob > spoof_prob else "SPOOF"
+    confidence = live_prob if label == "LIVE" else spoof_prob
+
+    # Filter 2: confidence threshold
+    if confidence < CONFIDENCE_THRESHOLD:
+        label = "UNCERTAIN"
+
+    return label, confidence, live_prob, spoof_prob
 
 
 # ============================================================
-# SMOOTHING
-# Dùng deque để lưu N kết quả gần nhất
-# Lấy kết quả xuất hiện nhiều nhất (majority voting)
+# FACE TRACKER
+# Tracks per-face state including smoothing and LIVE confirmation
 # ============================================================
 
-class ResultSmoother:
+class FaceTracker:
     """
-    Smooth kết quả qua nhiều frame để tránh nhấp nháy.
-    Dùng majority voting trên SMOOTH_FRAMES frame gần nhất.
-    """
-    def __init__(self, window_size=SMOOTH_FRAMES):
-        self.window      = deque(maxlen=window_size)
-        self.conf_window = deque(maxlen=window_size)
+    Tracks prediction state for a single face across frames.
 
-    def update(self, label, confidence):
-        self.window.append(label)
-        self.conf_window.append(confidence)
+    Combines majority-vote smoothing with a consecutive LIVE streak
+    counter to avoid triggering on brief flickers.
+    """
+
+    def __init__(self, window=SMOOTH_FRAMES):
+        self.labels      = deque(maxlen=window)
+        self.confs       = deque(maxlen=window)
+        self.live_streak = 0
+        self.confirmed   = False
+
+    def update(self, label, conf):
+        self.labels.append(label)
+        self.confs.append(conf)
+
+        if label == "LIVE":
+            self.live_streak += 1
+        else:
+            # Reset confirmation on any non-LIVE frame
+            self.live_streak = 0
+            self.confirmed   = False
+
+        if self.live_streak >= LIVE_CONFIRM_FRAMES:
+            self.confirmed = True
 
     def get_result(self):
-        if not self.window:
+        """Return smoothed label and average confidence."""
+        if not self.labels:
             return "UNCERTAIN", 0.0
+        label = Counter(self.labels).most_common(1)[0][0]
+        conf  = float(np.mean(self.confs))
+        return label, conf
 
-        # Majority voting
-        from collections import Counter
-        counts        = Counter(self.window)
-        smooth_label  = counts.most_common(1)[0][0]
-        smooth_conf   = np.mean(list(self.conf_window))
-        return smooth_label, smooth_conf
+    @property
+    def confirm_progress(self):
+        """Confirmation progress as a ratio from 0.0 to 1.0."""
+        return min(self.live_streak / LIVE_CONFIRM_FRAMES, 1.0)
 
 
 # ============================================================
 # DRAWING
 # ============================================================
 
-# Màu sắc cho từng kết quả
 COLORS = {
-    "LIVE"     : (0, 220, 0),    # xanh lá
-    "SPOOF"    : (0, 0, 220),    # đỏ
-    "UNCERTAIN": (0, 180, 220),  # vàng cam
+    "LIVE"     : (0, 220, 0),
+    "SPOOF"    : (0, 0, 220),
+    "UNCERTAIN": (0, 180, 220),
 }
 
-def draw_result(frame, box, label, confidence, live_prob, spoof_prob):
-    """
-    Vẽ bounding box và kết quả lên frame.
 
-    Hiển thị:
-        - Bounding box với màu tương ứng
-        - Label (LIVE / SPOOF / UNCERTAIN)
-        - Confidence %
-        - Thanh progress bar live/spoof probability
+def draw_result(frame, box, label, confidence, live_prob, spoof_prob, tracker):
+    """
+    Draw bounding box, prediction label, probability bar,
+    and LIVE confirmation progress onto frame.
     """
     x1, y1, x2, y2 = box
     color = COLORS.get(label, (200, 200, 200))
 
-    # Vẽ bounding box
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-    # Background cho text
-    text_main = f"{label}  {confidence*100:.1f}%"
-    (tw, th), _ = cv2.getTextSize(text_main, cv2.FONT_HERSHEY_DUPLEX, 0.7, 2)
-    cv2.rectangle(frame, (x1, y1 - th - 12), (x1 + tw + 8, y1), color, -1)
+    # Bounding box — thicker when confirmed LIVE
+    thickness = 3 if tracker.confirmed else 2
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
 
     # Label + confidence
-    cv2.putText(frame, text_main,
-                (x1 + 4, y1 - 6),
-                cv2.FONT_HERSHEY_DUPLEX, 0.7,
-                (255, 255, 255), 2)
+    text = f"{label}  {confidence*100:.1f}%"
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_DUPLEX, 0.7, 2)
+    cv2.rectangle(frame, (x1, y1 - th - 12), (x1 + tw + 8, y1), color, -1)
+    cv2.putText(frame, text, (x1 + 4, y1 - 6),
+                cv2.FONT_HERSHEY_DUPLEX, 0.7, (255, 255, 255), 2)
 
-    # Thanh probability bar bên dưới bbox
-    bar_y    = y2 + 10
-    bar_w    = x2 - x1
-    bar_h    = 8
-
-    # Background bar
-    cv2.rectangle(frame, (x1, bar_y), (x2, bar_y + bar_h),
-                  (60, 60, 60), -1)
-
-    # Live probability (xanh)
-    live_w = int(bar_w * live_prob)
-    cv2.rectangle(frame, (x1, bar_y), (x1 + live_w, bar_y + bar_h),
-                  (0, 220, 0), -1)
-
-    # Text live/spoof %
-    cv2.putText(frame,
-                f"L:{live_prob*100:.0f}%  S:{spoof_prob*100:.0f}%",
+    # Live/Spoof probability bar
+    bar_y, bar_w, bar_h = y2 + 10, x2 - x1, 8
+    cv2.rectangle(frame, (x1, bar_y), (x2, bar_y + bar_h), (60, 60, 60), -1)
+    cv2.rectangle(frame, (x1, bar_y),
+                  (x1 + int(bar_w * live_prob), bar_y + bar_h), (0, 220, 0), -1)
+    cv2.putText(frame, f"L:{live_prob*100:.0f}%  S:{spoof_prob*100:.0f}%",
                 (x1, bar_y + bar_h + 14),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-                (200, 200, 200), 1)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+
+    # LIVE confirmation progress bar
+    if label == "LIVE" and not tracker.confirmed:
+        prog_y = y2 + 32
+        prog_w = int(bar_w * tracker.confirm_progress)
+        cv2.rectangle(frame, (x1, prog_y), (x2, prog_y + 5), (40, 40, 40), -1)
+        cv2.rectangle(frame, (x1, prog_y), (x1 + prog_w, prog_y + 5),
+                      (0, 255, 200), -1)
+        frames_left = LIVE_CONFIRM_FRAMES - tracker.live_streak
+        cv2.putText(frame, f"Verifying... ({frames_left} frames left)",
+                    (x1, prog_y + 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 200), 1)
+
+    # Confirmed LIVE badge
+    if tracker.confirmed:
+        cv2.putText(frame, "CONFIRMED LIVE",
+                    (x1, y2 + 32),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 200), 2)
 
     return frame
 
 
 def draw_overlay(frame, fps):
-    """Vẽ thông tin overlay góc trên bên trái."""
-    h, w = frame.shape[:2]
-
-    # Background mờ
+    """Draw FPS and info overlay on the top-left corner."""
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, 0), (280, 70), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
 
     cv2.putText(frame, "Face Anti-Spoofing",
-                (8, 22), cv2.FONT_HERSHEY_DUPLEX, 0.6,
-                (255, 255, 255), 1)
-
-    # FPS to và màu vàng dễ thấy
+                (8, 22), cv2.FONT_HERSHEY_DUPLEX, 0.6, (255, 255, 255), 1)
     cv2.putText(frame, f"FPS: {fps:.1f}",
-                (8, 52), cv2.FONT_HERSHEY_DUPLEX, 0.8,
-                (0, 255, 255), 2)  # màu vàng, chữ to hơn
-
+                (8, 52), cv2.FONT_HERSHEY_DUPLEX, 0.8, (0, 255, 255), 2)
     cv2.putText(frame, "Q: Quit",
-                (200, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                (180, 180, 180), 1)
+                (200, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
 
     return frame
 
@@ -280,91 +272,75 @@ def draw_overlay(frame, fps):
 # ============================================================
 
 def main():
-    print("\n🚀 Khởi động Face Anti-Spoofing realtime...")
-    print(f"   Model              : {MODEL_PATH}")
-    print(f"   Confidence threshold: {CONFIDENCE_THRESHOLD*100:.0f}%")
-    print(f"   Smooth frames      : {SMOOTH_FRAMES}")
-    print(f"   Nhấn Q để thoát\n")
+    print("Starting Face Anti-Spoofing realtime...")
+    print(f"  Model               : {MODEL_PATH}")
+    print(f"  Dead zone           : {FAS_DEAD_ZONE}")
+    print(f"  Confidence threshold: {CONFIDENCE_THRESHOLD*100:.0f}%")
+    print(f"  Smooth frames       : {SMOOTH_FRAMES}")
+    print(f"  LIVE confirm frames : {LIVE_CONFIRM_FRAMES}")
+    print(f"  Press Q to quit\n")
 
-    # Load models
     fas_model = load_antispoof_model(MODEL_PATH)
-    detector=  YOLO(r"G:\FPTU CAC KY\FPTU ki 5\DPL302m\ToanBoFinalProject\model.pt")# face detector
-    print("✅ Loaded YOLO detector")
+    detector  = YOLO(FACE_DET_PATH)
+    print("Loaded YOLO detector")
 
-    # Khởi tạo smoother cho tối đa 10 khuôn mặt
-    smoothers = {i: ResultSmoother() for i in range(10)}
+    # One tracker per face slot (max 5 faces)
+    trackers = {i: FaceTracker() for i in range(5)}
 
-    # Mở webcam
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
-        print("❌ Không mở được webcam!")
+        print("Error: Cannot open webcam.")
         return
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    # Lower resolution for higher FPS
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-    # FPS counter
-    import time
     prev_time = time.time()
-    fps       = 0.0
+    fps = 0.0
 
-    print("✅ Webcam sẵn sàng! Nhấn Q để thoát.\n")
+    print("Webcam ready. Press Q to quit.\n")
 
     while True:
         ret, frame = cap.read()
         if not ret:
-            print("❌ Không đọc được frame từ webcam!")
+            print("Error: Cannot read frame from webcam.")
             break
 
-        # ── Detect faces ──
-        results = detector(frame, imgsz=320, device=DEVICE,
-                           verbose=False, conf=0.5)
-
-        face_count = 0
+        # Lower imgsz for faster YOLO inference
+        results = detector(frame, imgsz=256, device=DEVICE, verbose=False, conf=0.5)
 
         for r in results:
             for i, box in enumerate(r.boxes):
-                # Crop face với margin
+                tracker = trackers[min(i, 4)]
+
                 face_rgb, crop_box = crop_face_with_margin(
                     frame, box.xyxy[0].cpu().numpy()
                 )
-
                 if face_rgb is None:
                     continue
 
-                # Predict
-                label, confidence, live_prob, spoof_prob = predict(
-                    fas_model, face_rgb
-                )
+                label, confidence, live_prob, spoof_prob = predict(fas_model, face_rgb)
 
-                # Smooth kết quả
-                smoother_id = min(i, 9)
-                smoothers[smoother_id].update(label, confidence)
-                smooth_label, smooth_conf = smoothers[smoother_id].get_result()
+                tracker.update(label, confidence)
+                smooth_label, smooth_conf = tracker.get_result()
 
-                # Vẽ kết quả
                 frame = draw_result(
                     frame, crop_box,
                     smooth_label, smooth_conf,
-                    live_prob, spoof_prob
+                    live_prob, spoof_prob,
+                    tracker
                 )
 
-                face_count += 1
-
-        # ── FPS ──
         curr_time = time.time()
-        fps       = 0.9 * fps + 0.1 * (1.0 / (curr_time - prev_time + 1e-6))
+        fps       = 0.9 * fps + 0.1 / (curr_time - prev_time + 1e-6)
         prev_time = curr_time
 
-        # ── Overlay ──
         frame = draw_overlay(frame, fps)
-
-        # ── Hiển thị ──
         cv2.imshow("Face Anti-Spoofing — FAS Demo", frame)
 
-        # Thoát khi nhấn Q
         if cv2.waitKey(1) & 0xFF == ord('q'):
-            print("\n👋 Thoát!")
+            print("Exiting.")
             break
 
     cap.release()
